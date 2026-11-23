@@ -1,0 +1,52 @@
+From f978ab908a43573c8f6ef009163ca10726e8b90a Mon Sep 17 00:00:00 2001
+From: Anish Pallati <i@anish.land>
+Date: Sun, 22 Nov 2026 05:55:43 -0500
+Subject: [PATCH] swb: run touch from PATH on Linux
+
+Signed-off-by: Anish Pallati <i@anish.land>
+---
+ Sources/XToolSupport/EmulatedTools+Live.swift | 21 +++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/Sources/XToolSupport/EmulatedTools+Live.swift b/Sources/XToolSupport/EmulatedTools+Live.swift
+index 8988d70..2c68990 100644
+--- a/Sources/XToolSupport/EmulatedTools+Live.swift
++++ b/Sources/XToolSupport/EmulatedTools+Live.swift
+@@ -17,6 +17,7 @@ extension EmulatedTools: DependencyKey {
+             ObjcopyTool(mode: .strip),
+             ObjcopyTool(mode: .bitcodeStrip),
+             ChmodTool(),
++            TouchTool(),
+             CodesignTool(),
+             DerqTool(),
+         ]
+@@ -112,6 +113,26 @@ private struct ChmodTool: EmulatedTool {
+     }
+ }
+ 
++private struct TouchTool: EmulatedTool {
++    var name: String { "touch" }
++
++    func execute(
++        commandLine: [String],
++        workingDirectory: String?,
++        environment: [String: String]
++    ) async throws -> EmulatedToolResult {
++        try await Subprocess.run(
++            .name("touch"),
++            arguments: Arguments(Array(commandLine.dropFirst())),
++            environment: Environment(environment),
++            workingDirectory: workingDirectory.map { FilePath($0) },
++            output: .data(limit: .max),
++            error: .data(limit: .max),
++        )
++        .emulatedToolResult
++    }
++}
++
+ extension Environment {
+     init(_ dictionary: [String: String]) {
+         self = .custom([]).updating(
+-- 
+2.56.0
+

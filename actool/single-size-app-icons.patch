@@ -1,0 +1,682 @@
+From a02c8d6b21bb16cb89a76b8823fd418ec4a2655f Mon Sep 17 00:00:00 2001
+From: Ugo Mignon <56931733+TartanLeGrand@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 13:15:22 +0200
+Subject: [PATCH] feat(appicon): support single-size app icons
+
+Xcode 14+ writes an appiconset with one 1024x1024 universal entry
+(platform "ios", no idiom, no scale). The loader rejected it because
+the entry had no scale.
+
+Decode idiom as optional and generate the iPhone, iPad and store sizes
+from the master with an area-averaging downscaler, then reuse the
+multi-size path. The master must be exactly 1024x1024. Dark and tinted
+entries are skipped, other platforms are rejected.
+
+Also set the rendition key's icon index from the point size, as actool
+does, so icons of the same idiom and scale no longer share a key, and
+drop duplicate loose file names.
+---
+ README.md                                     |   1 +
+ Sources/AssetKit/AppIcon/AppIconPlist.swift   | 120 +++++++++++---
+ Sources/AssetKit/AppIcon/PNGResizer.swift     | 121 +++++++++++++++
+ Sources/AssetKit/CAR/RenditionKey.swift       |   7 +-
+ Sources/AssetKit/Errors.swift                 |   6 +
+ .../AssetKit/Rendition/ImageRenderer.swift    |  27 +++-
+ Sources/AssetKit/Rendition/Rendition.swift    |   4 +
+ Sources/AssetKit/Schema/Contents.swift        |  23 +++
+ Sources/AssetKit/XCAssetCompiler.swift        |   7 +-
+ .../SingleSizeAppIconTests.swift              | 146 ++++++++++++++++++
+ docs/coreui-970-format.md                     |  24 +++
+ 11 files changed, 456 insertions(+), 30 deletions(-)
+ create mode 100644 Sources/AssetKit/AppIcon/PNGResizer.swift
+ create mode 100644 Tests/AssetKitTests/SingleSizeAppIconTests.swift
+
+diff --git a/README.md b/README.md
+index ab64e24..ec01450 100644
+--- a/README.md
++++ b/README.md
+@@ -38,6 +38,7 @@ if let bundle = result.appIconBundle {
+   - JPG sources stored as preserved raw renditions (JPEG bytes passed through; original compression preserved)
+ - `.colorset` (sRGB and display-P3, hex or float components, dark/light appearances)
+ - `.appiconset` (per-idiom and per-size, with the loose-PNG fallback that SpringBoard expects alongside `Assets.car`). PNG sources only; SVG/JPG are rejected because SpringBoard's icon-render pipeline requires PNG.
++  - Single-size icons (Xcode 14+: one 1024x1024 `universal` / `platform: ios` entry): the iPhone, iPad and Settings/Spotlight/notification sizes are generated from the master by area-averaged downscaling, and the master is kept as the store icon. The master must be exactly 1024x1024. Dark and tinted (iOS 18) entries are skipped: the default icon is used for every appearance.
+ 
+ ## What it deliberately doesn't support
+ 
+diff --git a/Sources/AssetKit/AppIcon/AppIconPlist.swift b/Sources/AssetKit/AppIcon/AppIconPlist.swift
+index 9a4f6b2..645e134 100644
+--- a/Sources/AssetKit/AppIcon/AppIconPlist.swift
++++ b/Sources/AssetKit/AppIcon/AppIconPlist.swift
+@@ -10,7 +10,9 @@ struct IconFile: Sendable, Hashable {
+     var idiom: Idiom
+     var pointSize: Double
+     var scale: Int
+-    var sourceURL: URL
++    /// Name of the file the pixels came from, or the name actool would give a generated one.
++    var sourceName: String
++    var data: Data
+     var outputName: String
+ }
+ 
+@@ -20,27 +22,18 @@ enum AppIconPlistEmitter {
+         var ipadFiles: [String] = []
+         var allFiles: [IconFile] = []
+ 
+-        for image in appIcon.contents.images {
+-            guard let filename = image.filename, !filename.isEmpty else {
+-                throw XCAssetCompilerError.appIconSizeMissing(asset: appIcon.name, size: image.size)
+-            }
+-            let src = appIcon.directory.appendingPathComponent(filename)
+-            guard FileManager.default.fileExists(atPath: src.path) else {
+-                throw XCAssetCompilerError.missingReferencedFile(asset: appIcon.name, filename: filename)
+-            }
+-            guard let (w, _) = image.pointSize, let scale = image.scale?.factor else {
+-                throw XCAssetCompilerError.appIconSizeMissing(asset: appIcon.name, size: image.size)
+-            }
+-            let bundleName = "\(appIcon.name)\(formatSize(w))x\(formatSize(w))"
+-            let entry = IconFile(
+-                idiom: image.idiom,
+-                pointSize: w,
+-                scale: scale,
+-                sourceURL: src,
++        let entries = try iconEntries(for: appIcon)
++        for entry in entries {
++            let bundleName = "\(appIcon.name)\(formatSize(entry.pointSize))x\(formatSize(entry.pointSize))"
++            allFiles.append(IconFile(
++                idiom: entry.idiom,
++                pointSize: entry.pointSize,
++                scale: entry.scale,
++                sourceName: entry.sourceName,
++                data: entry.data,
+                 outputName: bundleName
+-            )
+-            allFiles.append(entry)
+-            switch image.idiom {
++            ))
++            switch entry.idiom {
+             case .iphone:
+                 if !iphoneFiles.contains(bundleName) { iphoneFiles.append(bundleName) }
+             case .ipad:
+@@ -87,6 +80,91 @@ enum AppIconPlistEmitter {
+         )
+     }
+ 
++    private struct Entry {
++        var idiom: Idiom
++        var pointSize: Double
++        var scale: Int
++        var sourceName: String
++        var data: Data
++    }
++
++    /// The icons to emit: one per `Contents.json` entry, or, for the single-size
++    /// format, the sizes generated from the 1024x1024 master.
++    private static func iconEntries(for appIcon: LoadedAppIcon) throws -> [Entry] {
++        var entries: [Entry] = []
++        for image in appIcon.contents.images {
++            if let platform = image.platform, platform != "ios" {
++                throw XCAssetCompilerError.unsupportedAppIconPlatform(asset: appIcon.name, platform: platform)
++            }
++            // Dark and tinted variants (iOS 18) are not compiled yet; the default icon is used for every appearance.
++            if !(image.appearances ?? []).isEmpty { continue }
++
++            guard let filename = image.filename, !filename.isEmpty else {
++                throw XCAssetCompilerError.appIconSizeMissing(asset: appIcon.name, size: image.size)
++            }
++            let src = appIcon.directory.appendingPathComponent(filename)
++            guard FileManager.default.fileExists(atPath: src.path) else {
++                throw XCAssetCompilerError.missingReferencedFile(asset: appIcon.name, filename: filename)
++            }
++            let data = try Data(contentsOf: src)
++
++            if image.isSingleSizeMaster {
++                entries.append(contentsOf: try expandMaster(data, filename: filename, appIcon: appIcon))
++                continue
++            }
++            guard let (w, _) = image.pointSize, let scale = image.scale?.factor else {
++                throw XCAssetCompilerError.appIconSizeMissing(asset: appIcon.name, size: image.size)
++            }
++            entries.append(Entry(idiom: image.idiom, pointSize: w, scale: scale, sourceName: filename, data: data))
++        }
++        return entries
++    }
++
++    /// Point sizes and scales actool generates from a single-size master for iOS.
++    private static let generatedSizes: [(idiom: Idiom, points: Double, scale: Int)] = [
++        (.iphone, 20, 2), (.iphone, 20, 3),
++        (.iphone, 29, 2), (.iphone, 29, 3),
++        (.iphone, 40, 2), (.iphone, 40, 3),
++        (.iphone, 60, 2), (.iphone, 60, 3),
++        (.ipad, 20, 1), (.ipad, 20, 2),
++        (.ipad, 29, 1), (.ipad, 29, 2),
++        (.ipad, 40, 1), (.ipad, 40, 2),
++        (.ipad, 76, 1), (.ipad, 76, 2),
++        (.ipad, 83.5, 2),
++    ]
++
++    private static func expandMaster(_ data: Data, filename: String, appIcon: LoadedAppIcon) throws -> [Entry] {
++        let master = try PNGResizer.decode(data)
++        guard master.width == 1024, master.height == 1024 else {
++            throw XCAssetCompilerError.appIconSourceSizeMismatch(
++                asset: appIcon.name,
++                filename: filename,
++                expected: "1024x1024",
++                actual: "\(master.width)x\(master.height)"
++            )
++        }
++        var resized: [Int: Data] = [:]
++        var out: [Entry] = []
++        for size in generatedSizes {
++            let pixels = Int((size.points * Double(size.scale)).rounded())
++            if resized[pixels] == nil {
++                resized[pixels] = try PNGResizer.resize(master, width: pixels, height: pixels)
++            }
++            let suffix = size.scale == 1 ? "" : "@\(size.scale)x"
++            let name = "\(formatSize(size.points))x\(formatSize(size.points))"
++            out.append(Entry(
++                idiom: size.idiom,
++                pointSize: size.points,
++                scale: size.scale,
++                sourceName: "\(appIcon.name)-\(name)\(suffix).png",
++                data: resized[pixels]!
++            ))
++        }
++        // The store icon is the master itself.
++        out.append(Entry(idiom: .marketing, pointSize: 1024, scale: 1, sourceName: filename, data: data))
++        return out
++    }
++
+     private static func formatSize(_ n: Double) -> String {
+         let rounded = n.rounded()
+         if abs(n - rounded) < 0.001 {
+diff --git a/Sources/AssetKit/AppIcon/PNGResizer.swift b/Sources/AssetKit/AppIcon/PNGResizer.swift
+new file mode 100644
+index 0000000..4074e85
+--- /dev/null
++++ b/Sources/AssetKit/AppIcon/PNGResizer.swift
+@@ -0,0 +1,121 @@
++import Foundation
++import PNG
++
++/// Area-averaging PNG downscaler, used to expand a single-size app icon
++/// master into the sizes the home screen, Spotlight and Settings need.
++///
++/// Averaging is done on premultiplied alpha so transparent pixels don't bleed
++/// their (meaningless) colour into the edges.
++enum PNGResizer {
++    struct Decoded {
++        var width: Int
++        var height: Int
++        /// Premultiplied RGBA, 0...255 as Float.
++        var pixels: [Float]
++    }
++
++    private struct MemoryStream: PNG.BytestreamSource {
++        var bytes: [UInt8]
++        var offset = 0
++        mutating func read(count: Int) -> [UInt8]? {
++            guard offset + count <= bytes.count else { return nil }
++            defer { offset += count }
++            return Array(bytes[offset..<offset + count])
++        }
++    }
++
++    private struct MemoryDestination: PNG.BytestreamDestination {
++        var bytes: [UInt8] = []
++        mutating func write(_ data: [UInt8]) -> Void? {
++            bytes.append(contentsOf: data)
++            return ()
++        }
++    }
++
++    static func decode(_ data: Data) throws -> Decoded {
++        var stream = MemoryStream(bytes: [UInt8](data))
++        let image = try PNG.Image.decompress(stream: &stream)
++        let rgba: [PNG.RGBA<UInt8>] = image.unpack(as: PNG.RGBA<UInt8>.self)
++        var pixels = [Float](repeating: 0, count: rgba.count * 4)
++        for (i, px) in rgba.enumerated() {
++            let a = Float(px.a) / 255
++            pixels[i * 4 + 0] = Float(px.r) * a
++            pixels[i * 4 + 1] = Float(px.g) * a
++            pixels[i * 4 + 2] = Float(px.b) * a
++            pixels[i * 4 + 3] = Float(px.a)
++        }
++        return Decoded(width: image.size.x, height: image.size.y, pixels: pixels)
++    }
++
++    /// Returns PNG bytes of `source` scaled to `width` x `height`.
++    static func resize(_ source: Decoded, width: Int, height: Int) throws -> Data {
++        // Horizontal pass: `source.height` rows, each shrunk to `width` pixels.
++        let horizontal = resample(
++            source.pixels, outer: source.height, srcCount: source.width, dstCount: width,
++            srcStep: 4, srcOuterStep: source.width * 4, dstStep: 4, dstOuterStep: width * 4
++        )
++        // Vertical pass: `width` columns, each shrunk to `height` pixels.
++        let scaled = resample(
++            horizontal, outer: width, srcCount: source.height, dstCount: height,
++            srcStep: width * 4, srcOuterStep: 4, dstStep: width * 4, dstOuterStep: 4
++        )
++
++        var rgba = [PNG.RGBA<UInt8>](repeating: PNG.RGBA<UInt8>(0, 0, 0, 0), count: width * height)
++        for i in 0..<(width * height) {
++            let a = scaled[i * 4 + 3]
++            guard a > 0 else { continue }
++            let k = 255 / a
++            rgba[i] = PNG.RGBA<UInt8>(
++                clamp(scaled[i * 4 + 0] * k), clamp(scaled[i * 4 + 1] * k), clamp(scaled[i * 4 + 2] * k), clamp(a)
++            )
++        }
++        let image = PNG.Image(
++            packing: rgba,
++            size: (x: width, y: height),
++            layout: PNG.Layout(format: .rgba8(palette: [], fill: nil))
++        )
++        var out = MemoryDestination()
++        try image.compress(stream: &out)
++        return Data(out.bytes)
++    }
++
++    private static func clamp(_ v: Float) -> UInt8 {
++        UInt8(max(0, min(255, v.rounded())))
++    }
++
++    /// One separable pass of box (area) resampling along an axis. Steps are in `Float` units.
++    private static func resample(
++        _ src: [Float], outer: Int, srcCount: Int, dstCount: Int,
++        srcStep: Int, srcOuterStep: Int, dstStep: Int, dstOuterStep: Int
++    ) -> [Float] {
++        var dst = [Float](repeating: 0, count: outer * dstCount * 4)
++        let ratio = Double(srcCount) / Double(dstCount)
++        src.withUnsafeBufferPointer { src in
++            dst.withUnsafeMutableBufferPointer { dst in
++                for d in 0..<dstCount {
++                    let start = Double(d) * ratio
++                    let end = start + ratio
++                    let first = Int(start)
++                    let last = min(srcCount - 1, Int(end.nextDown))
++                    for line in 0..<outer {
++                        var r = 0.0, g = 0.0, b = 0.0, a = 0.0
++                        for s in first...last {
++                            let weight = min(end, Double(s + 1)) - max(start, Double(s))
++                            let base = line * srcOuterStep + s * srcStep
++                            r += Double(src[base]) * weight
++                            g += Double(src[base + 1]) * weight
++                            b += Double(src[base + 2]) * weight
++                            a += Double(src[base + 3]) * weight
++                        }
++                        let out = line * dstOuterStep + d * dstStep
++                        dst[out] = Float(r / ratio)
++                        dst[out + 1] = Float(g / ratio)
++                        dst[out + 2] = Float(b / ratio)
++                        dst[out + 3] = Float(a / ratio)
++                    }
++                }
++            }
++        }
++        return dst
++    }
++}
+diff --git a/Sources/AssetKit/CAR/RenditionKey.swift b/Sources/AssetKit/CAR/RenditionKey.swift
+index 68f3c35..0bb9688 100644
+--- a/Sources/AssetKit/CAR/RenditionKey.swift
++++ b/Sources/AssetKit/CAR/RenditionKey.swift
+@@ -54,10 +54,9 @@ struct RenditionKey: Hashable, Sendable {
+             switch body.kind {
+             case .appIcon:
+                 self.part = Part.appIcon.rawValue
+-                // Dimension2 is the appicon "Icon Index" slot. v1 only
+-                // emits one logical icon size per appiconset, so this is
+-                // always 1.
+-                self.dimension2 = 1
++                // Dimension2 is the appicon "Icon Index" slot: it tells the
++                // sizes of one appiconset apart.
++                self.dimension2 = body.iconIndex
+             case .image:
+                 self.part = Part.image.rawValue
+                 // Generic image assets don't use Dimension2 at all.
+diff --git a/Sources/AssetKit/Errors.swift b/Sources/AssetKit/Errors.swift
+index 4815962..288ba58 100644
+--- a/Sources/AssetKit/Errors.swift
++++ b/Sources/AssetKit/Errors.swift
+@@ -11,6 +11,8 @@ public enum XCAssetCompilerError: Error, Sendable, Equatable {
+     case multipleAppIconSets([String])
+     case appIconSetInNamespace(String)
+     case appIconSizeMissing(asset: String, size: String)
++    case appIconSourceSizeMismatch(asset: String, filename: String, expected: String, actual: String)
++    case unsupportedAppIconPlatform(asset: String, platform: String)
+     case notADirectory(path: String)
+     case unsupportedAssetType(String)
+     case malformedJPEG(reason: String)
+@@ -42,6 +44,10 @@ extension XCAssetCompilerError: CustomStringConvertible {
+             return "Catalog has more than one .appiconset: \(names.joined(separator: ", "))"
+         case .appIconSizeMissing(let asset, let size):
+             return "AppIcon '\(asset)' declares size \(size) but no source file matched"
++        case .appIconSourceSizeMismatch(let asset, let filename, let expected, let actual):
++            return "AppIcon '\(asset)' source file '\(filename)' is \(actual) but its entry declares \(expected)"
++        case .unsupportedAppIconPlatform(let asset, let platform):
++            return "AppIcon '\(asset)' targets platform '\(platform)'; only ios is supported"
+         case .notADirectory(let path):
+             return "Expected an .xcassets directory at \(path)"
+         case .unsupportedAssetType(let name):
+diff --git a/Sources/AssetKit/Rendition/ImageRenderer.swift b/Sources/AssetKit/Rendition/ImageRenderer.swift
+index ec3a675..e363d5e 100644
+--- a/Sources/AssetKit/Rendition/ImageRenderer.swift
++++ b/Sources/AssetKit/Rendition/ImageRenderer.swift
+@@ -62,11 +62,11 @@ enum ImageRenderer {
+     static func appIconRenditions(for appIcon: LoadedAppIcon, files: [IconFile]) throws -> [Rendition] {
+         var out: [Rendition] = []
+         for file in files {
+-            let filename = file.sourceURL.lastPathComponent
++            let filename = file.sourceName
+             guard SourceFormat.detect(filename: filename) == .png else {
+                 throw XCAssetCompilerError.unsupportedAppIconSource(asset: appIcon.name, filename: filename)
+             }
+-            let bytes = try Data(contentsOf: file.sourceURL)
++            let bytes = file.data
+             let scale: Scale = {
+                 switch file.scale {
+                 case 1: return .x1
+@@ -89,8 +89,29 @@ enum ImageRenderer {
+                 filename: filename,
+                 kind: .appIcon
+             )
+-            out.append(contentsOf: try PNGSource.renditions(bytes: bytes, context: ctx))
++            var renditions = try PNGSource.renditions(bytes: bytes, context: ctx)
++            for i in renditions.indices {
++                if case .bitmap(var body) = renditions[i].body {
++                    body.iconIndex = iconIndex(idiom: file.idiom, pointSize: file.pointSize)
++                    renditions[i].body = .bitmap(body)
++                }
++            }
++            out.append(contentsOf: renditions)
+         }
+         return out
+     }
++
++    /// See `BitmapBody.iconIndex`.
++    private static func iconIndex(idiom: Idiom, pointSize: Double) -> UInt16 {
++        if idiom == .marketing { return 8 }
++        switch pointSize {
++        case 20: return 1
++        case 29: return 2
++        case 40: return 3
++        case 60: return 4
++        case 76: return 5
++        case 83.5: return 6
++        default: return 1
++        }
++    }
+ }
+diff --git a/Sources/AssetKit/Rendition/Rendition.swift b/Sources/AssetKit/Rendition/Rendition.swift
+index bcc7859..ffc64cb 100644
+--- a/Sources/AssetKit/Rendition/Rendition.swift
++++ b/Sources/AssetKit/Rendition/Rendition.swift
+@@ -41,6 +41,10 @@ struct BitmapBody: Sendable {
+     /// classification (e.g. when re-rasterising via the preserved vector
+     /// source at a non-intrinsic size). PNG / appicon bitmaps leave it false.
+     var derivedFromVector: Bool = false
++    /// App icon sizes are told apart by the key's dimension2 slot (the "icon index"):
++    /// 1...6 for 20, 29, 40, 60, 76 and 83.5 points, 8 for the 1024-point store icon.
++    /// Matches an actool-built catalog; unused for other kinds.
++    var iconIndex: UInt16 = 1
+     /// The source filename (e.g. "icon@2x.png"). Stored in the CSI header's
+     /// 128-char name field; actool uses the filename here, not the asset name.
+     var renditionName: String
+diff --git a/Sources/AssetKit/Schema/Contents.swift b/Sources/AssetKit/Schema/Contents.swift
+index e387806..ac49261 100644
+--- a/Sources/AssetKit/Schema/Contents.swift
++++ b/Sources/AssetKit/Schema/Contents.swift
+@@ -123,12 +123,29 @@ struct ImageSetContents: Codable, Sendable {
+ 
+ struct AppIconContents: Codable, Sendable {
+     struct Image: Codable, Sendable {
++        /// Absent in the single-size format Xcode 14+ writes
++        /// (`{"platform": "ios", "size": "1024x1024"}`); decoded as `.universal`.
+         var idiom: Idiom
+         var size: String
+         var scale: Scale?
+         var filename: String?
+         var role: String?
+         var subtype: String?
++        var platform: String?
++        /// Dark / tinted variants (iOS 18+). Absent for the default ("Any") icon.
++        var appearances: [Appearance]?
++
++        init(from decoder: any Decoder) throws {
++            let c = try decoder.container(keyedBy: CodingKeys.self)
++            idiom = try c.decodeIfPresent(Idiom.self, forKey: .idiom) ?? .universal
++            size = try c.decode(String.self, forKey: .size)
++            scale = try c.decodeIfPresent(Scale.self, forKey: .scale)
++            filename = try c.decodeIfPresent(String.self, forKey: .filename)
++            role = try c.decodeIfPresent(String.self, forKey: .role)
++            subtype = try c.decodeIfPresent(String.self, forKey: .subtype)
++            platform = try c.decodeIfPresent(String.self, forKey: .platform)
++            appearances = try c.decodeIfPresent([Appearance].self, forKey: .appearances)
++        }
+ 
+         var pointSize: (Double, Double)? {
+             let parts = size.split(separator: "x")
+@@ -137,6 +154,12 @@ struct AppIconContents: Codable, Sendable {
+                   let h = Double(parts[1]) else { return nil }
+             return (w, h)
+         }
++
++        /// A single 1024x1024 master that actool expands into every size the
++        /// target needs: universal idiom, no scale (or 1x), no appearance.
++        var isSingleSizeMaster: Bool {
++            idiom == .universal && (scale ?? .x1) == .x1 && pointSize.map { $0 == (1024, 1024) } == true
++        }
+     }
+     var images: [Image]
+     var info: CatalogContents.Info
+diff --git a/Sources/AssetKit/XCAssetCompiler.swift b/Sources/AssetKit/XCAssetCompiler.swift
+index 56beff6..9dbcc9a 100644
+--- a/Sources/AssetKit/XCAssetCompiler.swift
++++ b/Sources/AssetKit/XCAssetCompiler.swift
+@@ -98,11 +98,14 @@ public struct XCAssetCompiler: Sendable {
+             renditions.append(contentsOf: try ImageRenderer.appIconRenditions(for: appIcon, files: plist.iconFiles))
+ 
+             var looseFiles: [LooseFile] = []
++            var seen: Set<String> = []
+             for file in plist.iconFiles {
+                 let suffix = file.scale == 1 ? "" : "@\(file.scale)x"
+                 let target = "\(file.outputName)\(suffix).png"
+-                let data = try Data(contentsOf: file.sourceURL)
+-                looseFiles.append(LooseFile(name: target, data: data))
++                // iPhone and iPad entries can share a name (and, when generated, pixels).
++                if seen.insert(target).inserted {
++                    looseFiles.append(LooseFile(name: target, data: file.data))
++                }
+             }
+ 
+             appIconBundle = AppIconBundle(
+diff --git a/Tests/AssetKitTests/SingleSizeAppIconTests.swift b/Tests/AssetKitTests/SingleSizeAppIconTests.swift
+new file mode 100644
+index 0000000..f1168ef
+--- /dev/null
++++ b/Tests/AssetKitTests/SingleSizeAppIconTests.swift
+@@ -0,0 +1,146 @@
++import Foundation
++import PNG
++import Testing
++@testable import AssetKit
++
++@Suite("Single-size AppIcon")
++struct SingleSizeAppIconTests {
++    @Test("Xcode 14+ single 1024 universal icon expands to the iPhone, iPad and store sizes")
++    func expandsMaster() async throws {
++        let catalog = try makeCatalog(entries: [
++            #"{ "filename": "icon.png", "idiom": "universal", "platform": "ios", "size": "1024x1024" }"#,
++        ], master: solidPNG(size: 1024, rgba: (3, 246, 254, 255)))
++        defer { try? FileManager.default.removeItem(at: catalog) }
++
++        let result = try await XCAssetCompiler(deploymentTarget: "17.0").compile(catalog: catalog)
++        #expect(result.carData.prefix(8) == Data("BOMStore".utf8))
++
++        // every generated rendition has a distinct key (the icon index tells sizes apart)
++        let appIcon = try loadAppIcon(at: catalog)
++        let renditions = try ImageRenderer.appIconRenditions(
++            for: appIcon,
++            files: AppIconPlistEmitter.emit(appIcon).iconFiles
++        )
++        #expect(renditions.count == 18)
++        #expect(Set(renditions.map { RenditionKey(rendition: $0).encode() }).count == renditions.count)
++
++        let bundle = try #require(result.appIconBundle)
++        #expect(bundle.primaryIconName == "AppIcon")
++        let icons = bundle.infoPlistAdditions["CFBundleIcons"] as? [String: any Sendable]
++        let primary = icons?["CFBundlePrimaryIcon"] as? [String: any Sendable]
++        #expect(primary?["CFBundleIconFiles"] as? [String] == [
++            "AppIcon20x20", "AppIcon29x29", "AppIcon40x40", "AppIcon60x60",
++        ])
++        let ipad = bundle.infoPlistAdditions["CFBundleIcons~ipad"] as? [String: any Sendable]
++        let ipadPrimary = ipad?["CFBundlePrimaryIcon"] as? [String: any Sendable]
++        #expect((ipadPrimary?["CFBundleIconFiles"] as? [String])?.contains("AppIcon83.5x83.5") == true)
++
++        // names are unique and each file has the pixel size its name promises
++        let names = bundle.looseFiles.map(\.name)
++        #expect(Set(names).count == names.count)
++        let expected: [String: Int] = [
++            "AppIcon60x60@2x.png": 120, "AppIcon60x60@3x.png": 180, "AppIcon76x76@2x.png": 152,
++            "AppIcon83.5x83.5@2x.png": 167, "AppIcon20x20.png": 20, "AppIcon1024x1024.png": 1024,
++        ]
++        for (name, pixels) in expected {
++            let file = try #require(bundle.looseFiles.first { $0.name == name }, "missing \(name)")
++            let decoded = try PNGResizer.decode(file.data)
++            #expect(decoded.width == pixels && decoded.height == pixels, "\(name) is \(decoded.width)")
++        }
++    }
++
++    @Test("Dark and tinted variants are skipped, not compiled as the default icon")
++    func appearanceVariantsAreSkipped() throws {
++        // the variants point at files that do not exist: they must not even be read
++        let catalog = try makeCatalog(entries: [
++            #"{ "filename": "icon.png", "idiom": "iphone", "scale": "2x", "size": "60x60" }"#,
++            #"""
++            { "appearances": [{ "appearance": "luminosity", "value": "dark" }],
++              "filename": "dark.png", "idiom": "iphone", "scale": "2x", "size": "60x60" }
++            """#,
++            #"""
++            { "appearances": [{ "appearance": "luminosity", "value": "tinted" }],
++              "filename": "tinted.png", "idiom": "iphone", "scale": "2x", "size": "60x60" }
++            """#,
++        ], master: solidPNG(size: 120, rgba: (1, 2, 3, 255)))
++        defer { try? FileManager.default.removeItem(at: catalog) }
++
++        let appIcon = try loadAppIcon(at: catalog)
++        #expect(try AppIconPlistEmitter.emit(appIcon).iconFiles.count == 1)
++    }
++
++    @Test("A master that is not 1024x1024 is rejected")
++    func wrongSizeThrows() throws {
++        let catalog = try makeCatalog(entries: [
++            #"{ "filename": "icon.png", "idiom": "universal", "platform": "ios", "size": "1024x1024" }"#,
++        ], master: solidPNG(size: 64, rgba: (1, 2, 3, 255)))
++        defer { try? FileManager.default.removeItem(at: catalog) }
++
++        let appIcon = try loadAppIcon(at: catalog)
++        #expect(throws: XCAssetCompilerError.self) { _ = try AppIconPlistEmitter.emit(appIcon) }
++    }
++
++    @Test("A non-iOS platform is rejected")
++    func otherPlatformThrows() throws {
++        let catalog = try makeCatalog(entries: [
++            #"{ "filename": "icon.png", "idiom": "universal", "platform": "watchos", "size": "1024x1024" }"#,
++        ], master: solidPNG(size: 16, rgba: (1, 2, 3, 255)))
++        defer { try? FileManager.default.removeItem(at: catalog) }
++
++        let appIcon = try loadAppIcon(at: catalog)
++        #expect(throws: XCAssetCompilerError.unsupportedAppIconPlatform(asset: "AppIcon", platform: "watchos")) {
++            _ = try AppIconPlistEmitter.emit(appIcon)
++        }
++    }
++
++    @Test("Downscaling averages instead of sampling, and keeps transparency")
++    func resizeAverages() throws {
++        // left half white, right half black, both opaque; 2x2 blocks average to grey at the seam only
++        var rgba = [PNG.RGBA<UInt8>]()
++        for _ in 0..<4 { rgba += [PNG.RGBA(255, 255, 255, 255), PNG.RGBA(0, 0, 0, 255), PNG.RGBA(255, 255, 255, 0), PNG.RGBA(0, 0, 0, 0)] }
++        let png = try encode(rgba, size: 4)
++        let decoded = try PNGResizer.decode(png)
++        let small = try PNGResizer.decode(PNGResizer.resize(decoded, width: 2, height: 2))
++        // top-left output pixel covers white + black opaque: premultiplied average is 127.5
++        #expect(abs(small.pixels[0] - 127.5) < 1)
++        #expect(small.pixels[3] == 255)
++        // top-right covers fully transparent pixels
++        #expect(small.pixels[7] == 0)
++    }
++}
++
++private func loadAppIcon(at catalog: URL) throws -> LoadedAppIcon {
++    let directory = catalog.appendingPathComponent("AppIcon.appiconset")
++    let contents = try JSONDecoder().decode(
++        AppIconContents.self,
++        from: Data(contentsOf: directory.appendingPathComponent("Contents.json"))
++    )
++    return LoadedAppIcon(name: "AppIcon", directory: directory, contents: contents)
++}
++
++private func makeCatalog(entries: [String], master: Data) throws -> URL {
++    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SingleSize-\(UUID().uuidString).xcassets")
++    let set = root.appendingPathComponent("AppIcon.appiconset")
++    try FileManager.default.createDirectory(at: set, withIntermediateDirectories: true)
++    try master.write(to: set.appendingPathComponent("icon.png"))
++    let json = #"{ "images": [\#(entries.joined(separator: ","))], "info": { "author": "xcode", "version": 1 } }"#
++    try Data(json.utf8).write(to: set.appendingPathComponent("Contents.json"))
++    return root
++}
++
++private func solidPNG(size: Int, rgba: (UInt8, UInt8, UInt8, UInt8)) -> Data {
++    let pixel = PNG.RGBA<UInt8>(rgba.0, rgba.1, rgba.2, rgba.3)
++    // swiftlint-free force try: a failure here is a broken test helper
++    return try! encode([PNG.RGBA<UInt8>](repeating: pixel, count: size * size), size: size)
++}
++
++private func encode(_ rgba: [PNG.RGBA<UInt8>], size: Int) throws -> Data {
++    let image = PNG.Image(
++        packing: rgba,
++        size: (x: size, y: rgba.count / size),
++        layout: PNG.Layout(format: .rgba8(palette: [], fill: nil))
++    )
++    var stream = MemoryBytestreamDestination()
++    try image.compress(stream: &stream)
++    return Data(stream.bytes)
++}
+diff --git a/docs/coreui-970-format.md b/docs/coreui-970-format.md
+index 889e2fe..60024c7 100644
+--- a/docs/coreui-970-format.md
++++ b/docs/coreui-970-format.md
+@@ -229,6 +229,30 @@ This writer's `NameIdentifier` is `CRC32-IEEE(name) & 0xFFFF`, whereas `actool`'
+ 
+ Imagesets have no such fallback. This is why divergences #4-6 above gate `UIImage(named:)` for image assets — there's no second chance.
+ 
++## App icons: what actool emits, and what is still unverified
++
++Observed in a catalog compiled by Xcode 26.5 from a multi-size `.appiconset` (iPhone and iPad 20/29/40/60/76/83.5 pt plus a 1024 px store icon), dumped without `assetutil`:
++
++- One bitmap rendition (`element=85`, `part=220`) per source file, named after the file (`AppIcon-60x60@2x.png`), not after the set.
++- The `dimension2` slot is the icon index: 1, 2, 3, 4, 5, 6 for 20, 29, 40, 60, 76, 83.5 pt, and 8 for the store icon (`idiom=6`, `ios-marketing`). This writer follows that mapping, so icons of the same idiom and scale no longer collide on one key.
++- Additional `part=218` records named `AppIcon` with no pixel data (one per scale / idiom / subtype). This writer does not emit them.
++- The loose PNGs next to `Assets.car` are only `AppIcon60x60@2x.png` and `AppIcon76x76@2x~ipad.png`, with `CFBundleIconFiles` limited to those names plus `CFBundleIconName`. This writer emits every size, without the `~ipad` suffix.
++- That catalog's `KEYFORMAT` has ten tokens (attribute 8 sits between `dimension2` and `identifier`), against nine here.
++
++Single-size icons (`{"platform": "ios", "size": "1024x1024"}`) are handled by generating the same per-size set from the master (area-averaged downscale), then going through the multi-size path. Whether actool emits the same renditions for a single-size source (it probably does, for the sizes the deployment target needs) has not been checked against actool output. Dark and tinted entries are skipped.
++
++To settle it on a Mac, compile a single-size catalog and compare:
++
++```sh
++xcrun actool --compile out --platform iphoneos --minimum-deployment-target 17.0 \
++  --app-icon AppIcon --output-partial-info-plist out/partial.plist \
++  --output-format human-readable-text Single.xcassets
++xcrun assetutil --info out/Assets.car | jq '.[] | {Name, RenditionName, Idiom, Scale, Appearance, PixelWidth}'
++cat out/partial.plist; ls out
++```
++
++Run it once with the default icon only and once with dark and tinted images added, and compare the rendition list, `Appearance` values and the partial plist with this writer's output.
++
+ ## Workflow: generating a fresh `actool` reference
+ 
+ When changing any CoreUI block-emitting code (`CAR/*.swift`, `BOM/*.swift`), the durable safety net is to generate a reference Assets.car with `actool` and compare bytes.
+-- 
+2.56.0
+

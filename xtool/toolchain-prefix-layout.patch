@@ -1,0 +1,54 @@
+From 52a402eacad184c4d1379ec5f3bd6c9f39a81b8a Mon Sep 17 00:00:00 2001
+From: Anish Pallati <i@anish.land>
+Date: Sun, 22 Nov 2026 05:29:12 -0500
+Subject: [PATCH 1/2] swb: accept toolchains installed without usr/
+
+Signed-off-by: Anish Pallati <i@anish.land>
+---
+ Sources/XToolSupport/Toolchain.swift | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/Sources/XToolSupport/Toolchain.swift b/Sources/XToolSupport/Toolchain.swift
+index b2eac36..7cb713e 100644
+--- a/Sources/XToolSupport/Toolchain.swift
++++ b/Sources/XToolSupport/Toolchain.swift
+@@ -74,6 +74,8 @@ public struct ToolchainProvider: DependencyKey, Sendable {
+             trimmed = runtimeResourcePath.dropLast("/usr/lib/swift".count)
+         } else if runtimeResourcePath.hasSuffix("/usr/local/lib/swift") {
+             trimmed = runtimeResourcePath.dropLast("/usr/local/lib/swift".count)
++        } else if runtimeResourcePath.hasSuffix("/lib/swift") {
++            trimmed = runtimeResourcePath.dropLast("/lib/swift".count)
+         } else {
+             throw Console.Error("Unexpected toolchain resource path: \(runtimeResourcePath)")
+         }
+-- 
+2.56.0
+
+
+From d818bf90a9993d5984a281b51eed5508974cf57f Mon Sep 17 00:00:00 2001
+From: Anish Pallati <i@anish.land>
+Date: Sun, 22 Nov 2026 05:42:45 -0500
+Subject: [PATCH 2/2] swb: find swiftc next to the resolved swift for hot
+ reload
+
+Signed-off-by: Anish Pallati <i@anish.land>
+---
+ Sources/XToolSupport/HotReloader.swift | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Sources/XToolSupport/HotReloader.swift b/Sources/XToolSupport/HotReloader.swift
+index 5e52ed0..cfce0f2 100644
+--- a/Sources/XToolSupport/HotReloader.swift
++++ b/Sources/XToolSupport/HotReloader.swift
+@@ -151,7 +151,7 @@ actor HotReloader {
+             let swiftc = FilePath(toolchain).appending("usr/bin/swiftc")
+             if FileManager.default.isExecutableFile(atPath: swiftc.string) { return swiftc }
+         }
+-        return try await d.toolchain.toolchainRoot.appending("usr/bin/swiftc")
++        return try await d.toolchain.swiftTool.removingLastComponent().appending("swiftc")
+     }
+ 
+     private static func canonicalPath(_ path: String) -> String? {
+-- 
+2.56.0
+
