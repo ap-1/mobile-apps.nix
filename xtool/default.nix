@@ -1,5 +1,6 @@
 {
   lib,
+  stdenv,
   callPackage,
   darwin,
   fetchFromGitHub,
@@ -48,7 +49,18 @@ xtool.overrideAttrs (
       # TODO: https://github.com/xtool-org/xtool/pull/466
       ./prepare-packages.patch
     ];
-    postPatch = useRcodesignFork;
+    postPatch =
+      useRcodesignFork
+      + lib.optionalString stdenv.hostPlatform.isDarwin ''
+        # nixpkgs uses swift-corelibs-xctest on Darwin, which has no XCTExpectFailure
+        rm Packages
+        mkdir Packages
+        ln -s "$swiftpmDeps"/Packages/* Packages/
+        rm Packages/swift-issue-reporting
+        cp -r --no-preserve=mode "$swiftpmDeps/Packages/swift-issue-reporting" Packages/
+        substituteInPlace Packages/swift-issue-reporting/Sources/IssueReportingTestSupport/XCTest.swift \
+          --replace-fail '#if _runtime(_ObjC)' '#if false'
+      '';
 
     swiftpmDeps = fetchSwiftPMDeps {
       inherit (finalAttrs) pname version src;
@@ -67,6 +79,10 @@ xtool.overrideAttrs (
     # libgcc's unwinder crashes when swift-testing backtraces errors thrown from async code
     preCheck = ''
       export SWT_SWIFT_ERROR_BACKTRACING_ENABLED=0
+    ''
+    + lib.optionalString stdenv.hostPlatform.isDarwin ''
+      # xtool defaults to ~/Library/Caches, and $HOME is /var/empty in the sandbox
+      export XTL_TMPDIR="$TMPDIR"
     '';
 
     # SwiftBuild loads its specs from these bundles next to the executable
