@@ -72,7 +72,8 @@ func printResults(_ outputs: [URL], format: String?) throws {
         outputs.forEach { print($0.path) }
         print()
     } else {
-        try writePlist(["com.apple.actool.compilation-results": ["output-files": outputs.map(\.path)]], to: "/dev/stdout")
+        try writePlist(
+            ["com.apple.actool.compilation-results": ["output-files": outputs.map(\.path)]], to: "/dev/stdout")
     }
 }
 
@@ -110,7 +111,9 @@ func run() async throws {
     let arguments = try Arguments(CommandLine.arguments.dropFirst())
 
     if arguments.flags.contains("--version") {
-        try writePlist(["com.apple.actool.version": ["bundle-version": version, "short-bundle-version": version]], to: "/dev/stdout")
+        try writePlist(
+            ["com.apple.actool.version": ["bundle-version": version, "short-bundle-version": version]],
+            to: "/dev/stdout")
         return
     }
 
@@ -130,7 +133,9 @@ func run() async throws {
 
     var outputs: [URL] = []
 
-    let symbolFlags = ["--generate-swift-asset-symbols", "--generate-objc-asset-symbols", "--generate-asset-symbol-index"]
+    let symbolFlags = [
+        "--generate-swift-asset-symbols", "--generate-objc-asset-symbols", "--generate-asset-symbol-index",
+    ]
     if symbolFlags.contains(where: { arguments.value($0) != nil }) {
         if arguments.value("--generate-swift-asset-symbols") != nil,
             arguments.value("--generate-swift-asset-symbol-extensions") != "NO"

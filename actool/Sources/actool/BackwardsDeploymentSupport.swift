@@ -1,118 +1,118 @@
 let backwardsDeploymentSupport = #"""
-// MARK: - Backwards Deployment Support -
+    // MARK: - Backwards Deployment Support -
 
-/// A color resource.
-struct ColorResource: Swift.Hashable, Swift.Sendable {
+    /// A color resource.
+    struct ColorResource: Swift.Hashable, Swift.Sendable {
 
-    /// An asset catalog color resource name.
-    fileprivate let name: Swift.String
+        /// An asset catalog color resource name.
+        fileprivate let name: Swift.String
 
-    /// An asset catalog color resource bundle.
-    fileprivate let bundle: Foundation.Bundle
+        /// An asset catalog color resource bundle.
+        fileprivate let bundle: Foundation.Bundle
 
-    /// Initialize a `ColorResource` with `name` and `bundle`.
-    init(name: Swift.String, bundle: Foundation.Bundle) {
-        self.name = name
-        self.bundle = bundle
+        /// Initialize a `ColorResource` with `name` and `bundle`.
+        init(name: Swift.String, bundle: Foundation.Bundle) {
+            self.name = name
+            self.bundle = bundle
+        }
+
     }
 
-}
+    /// An image resource.
+    struct ImageResource: Swift.Hashable, Swift.Sendable {
 
-/// An image resource.
-struct ImageResource: Swift.Hashable, Swift.Sendable {
+        /// An asset catalog image resource name.
+        fileprivate let name: Swift.String
 
-    /// An asset catalog image resource name.
-    fileprivate let name: Swift.String
+        /// An asset catalog image resource bundle.
+        fileprivate let bundle: Foundation.Bundle
 
-    /// An asset catalog image resource bundle.
-    fileprivate let bundle: Foundation.Bundle
+        /// Initialize an `ImageResource` with `name` and `bundle`.
+        init(name: Swift.String, bundle: Foundation.Bundle) {
+            self.name = name
+            self.bundle = bundle
+        }
 
-    /// Initialize an `ImageResource` with `name` and `bundle`.
-    init(name: Swift.String, bundle: Foundation.Bundle) {
-        self.name = name
-        self.bundle = bundle
     }
 
-}
+    #if canImport(AppKit)
+    @available(macOS 10.13, *)
+    @available(macCatalyst, unavailable)
+    extension AppKit.NSColor {
 
-#if canImport(AppKit)
-@available(macOS 10.13, *)
-@available(macCatalyst, unavailable)
-extension AppKit.NSColor {
+        /// Initialize a `NSColor` with a color resource.
+        convenience init(resource: ColorResource) {
+            self.init(named: NSColor.Name(resource.name), bundle: resource.bundle)!
+        }
 
-    /// Initialize a `NSColor` with a color resource.
-    convenience init(resource: ColorResource) {
-        self.init(named: NSColor.Name(resource.name), bundle: resource.bundle)!
     }
 
-}
+    protocol _ACResourceInitProtocol {}
+    extension AppKit.NSImage: _ACResourceInitProtocol {}
 
-protocol _ACResourceInitProtocol {}
-extension AppKit.NSImage: _ACResourceInitProtocol {}
+    @available(macOS 10.7, *)
+    @available(macCatalyst, unavailable)
+    extension _ACResourceInitProtocol {
 
-@available(macOS 10.7, *)
-@available(macCatalyst, unavailable)
-extension _ACResourceInitProtocol {
+        /// Initialize a `NSImage` with an image resource.
+        init(resource: ImageResource) {
+            self = resource.bundle.image(forResource: NSImage.Name(resource.name))! as! Self
+        }
 
-    /// Initialize a `NSImage` with an image resource.
-    init(resource: ImageResource) {
-        self = resource.bundle.image(forResource: NSImage.Name(resource.name))! as! Self
+    }
+    #endif
+
+    #if canImport(UIKit)
+    @available(iOS 11.0, tvOS 11.0, *)
+    @available(watchOS, unavailable)
+    extension UIKit.UIColor {
+
+        /// Initialize a `UIColor` with a color resource.
+        convenience init(resource: ColorResource) {
+    #if !os(watchOS)
+            self.init(named: resource.name, in: resource.bundle, compatibleWith: nil)!
+    #else
+            self.init()
+    #endif
+        }
+
     }
 
-}
-#endif
+    @available(iOS 11.0, tvOS 11.0, *)
+    @available(watchOS, unavailable)
+    extension UIKit.UIImage {
 
-#if canImport(UIKit)
-@available(iOS 11.0, tvOS 11.0, *)
-@available(watchOS, unavailable)
-extension UIKit.UIColor {
+        /// Initialize a `UIImage` with an image resource.
+        convenience init(resource: ImageResource) {
+    #if !os(watchOS)
+            self.init(named: resource.name, in: resource.bundle, compatibleWith: nil)!
+    #else
+            self.init()
+    #endif
+        }
 
-    /// Initialize a `UIColor` with a color resource.
-    convenience init(resource: ColorResource) {
-#if !os(watchOS)
-        self.init(named: resource.name, in: resource.bundle, compatibleWith: nil)!
-#else
-        self.init()
-#endif
+    }
+    #endif
+
+    #if canImport(SwiftUI)
+    @available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
+    extension SwiftUI.Color {
+
+        /// Initialize a `Color` with a color resource.
+        init(_ resource: ColorResource) {
+            self.init(resource.name, bundle: resource.bundle)
+        }
+
     }
 
-}
+    @available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
+    extension SwiftUI.Image {
 
-@available(iOS 11.0, tvOS 11.0, *)
-@available(watchOS, unavailable)
-extension UIKit.UIImage {
+        /// Initialize an `Image` with an image resource.
+        init(_ resource: ImageResource) {
+            self.init(resource.name, bundle: resource.bundle)
+        }
 
-    /// Initialize a `UIImage` with an image resource.
-    convenience init(resource: ImageResource) {
-#if !os(watchOS)
-        self.init(named: resource.name, in: resource.bundle, compatibleWith: nil)!
-#else
-        self.init()
-#endif
     }
-
-}
-#endif
-
-#if canImport(SwiftUI)
-@available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
-extension SwiftUI.Color {
-
-    /// Initialize a `Color` with a color resource.
-    init(_ resource: ColorResource) {
-        self.init(resource.name, bundle: resource.bundle)
-    }
-
-}
-
-@available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
-extension SwiftUI.Image {
-
-    /// Initialize an `Image` with an image resource.
-    init(_ resource: ImageResource) {
-        self.init(resource.name, bundle: resource.bundle)
-    }
-
-}
-#endif
-"""#
+    #endif
+    """#

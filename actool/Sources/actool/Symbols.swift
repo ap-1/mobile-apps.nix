@@ -28,7 +28,10 @@ struct SymbolOptions {
     var includesImages: Bool
     var bundleID: String
 
-    init(platform: String?, deploymentTarget: String?, backwardsDeploymentSupport: String?, targetDevices: [String], bundleID: String) {
+    init(
+        platform: String?, deploymentTarget: String?, backwardsDeploymentSupport: String?, targetDevices: [String],
+        bundleID: String
+    ) {
         let cutoffs = [
             "iphoneos": 17, "iphonesimulator": 17, "appletvos": 17, "appletvsimulator": 17,
             "macosx": 14, "watchos": 10, "watchsimulator": 10,
@@ -55,7 +58,8 @@ struct SymbolOptions {
     }
 
     func appliesToAny(_ asset: CatalogAsset) -> Bool {
-        targetDevices.isEmpty || targetDevices.contains { device in asset.idioms.contains { $0 == "universal" || $0 == device } }
+        targetDevices.isEmpty
+            || targetDevices.contains { device in asset.idioms.contains { $0 == "universal" || $0 == device } }
     }
 }
 
@@ -74,7 +78,8 @@ func contents(of folder: URL) -> [String: Any] {
 func catalogAssets(_ catalog: URL) -> [CatalogAsset] {
     var assets: [CatalogAsset] = []
     func walk(_ folder: URL, relativePath: String, namespaces: [String]) {
-        let children = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+        let children =
+            ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
             .sorted { codePointOrder($0.lastPathComponent, $1.lastPathComponent) }
         for child in children {
@@ -85,7 +90,8 @@ func catalogAssets(_ catalog: URL) -> [CatalogAsset] {
             case "colorset": (kind, list, key) = (.color, "colors", "color")
             case "imageset": (kind, list, key) = (.image, "images", "filename")
             case "":
-                let namespace = (contents(of: child)["properties"] as? [String: Any])?["provides-namespace"] as? Bool ?? false
+                let namespace =
+                    (contents(of: child)["properties"] as? [String: Any])?["provides-namespace"] as? Bool ?? false
                 walk(child, relativePath: path, namespaces: namespace ? namespaces + [name] : namespaces)
                 continue
             default: continue
@@ -273,17 +279,20 @@ func objcSymbols(_ assets: [CatalogAsset], options: SymbolOptions) -> String {
         """
     let colors = listedAssets(assets, kind: .color, options: options)
     if !colors.isEmpty {
-        out += "/// The resource bundle ID.\nstatic NSString * const ACBundleID AC_SWIFT_PRIVATE = @\"\(options.bundleID)\";\n\n"
+        out +=
+            "/// The resource bundle ID.\nstatic NSString * const ACBundleID AC_SWIFT_PRIVATE = @\"\(options.bundleID)\";\n\n"
     }
     for (kind, listed) in [(AssetKind.color, colors), (.image, listedAssets(assets, kind: .image, options: options))] {
         var taken: Set<String> = []
         for asset in listed {
             let symbol = kind.objcPrefix + (asset.namespaces + [asset.name]).map(objcName).joined()
             guard taken.insert(symbol).inserted else {
-                out += "#warning The \"\(fullName(asset))\" \(kind.noun) asset name resolves to the symbol \"\(symbol)\" which already exists. Try renaming the asset.\n\n"
+                out +=
+                    "#warning The \"\(fullName(asset))\" \(kind.noun) asset name resolves to the symbol \"\(symbol)\" which already exists. Try renaming the asset.\n\n"
                 continue
             }
-            out += "/// The \"\(fullName(asset))\" asset catalog \(kind.noun) resource.\nstatic NSString * const \(symbol) AC_SWIFT_PRIVATE = @\"\(fullName(asset))\";\n\n"
+            out +=
+                "/// The \"\(fullName(asset))\" asset catalog \(kind.noun) resource.\nstatic NSString * const \(symbol) AC_SWIFT_PRIVATE = @\"\(fullName(asset))\";\n\n"
         }
     }
     return out + "#undef AC_SWIFT_PRIVATE\n"
