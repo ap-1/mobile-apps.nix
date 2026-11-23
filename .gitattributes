@@ -1,0 +1,3 @@
+deps.json linguist-generated
+
+examples/capacitor-testapp/ios/** linguist-vendored
